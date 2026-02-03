@@ -1,0 +1,598 @@
+"""
+Mean Reversion + Polynomial Derivative Backtest
+================================================
+TIGHTENED VERSION with:
+- Time filter: 8:30 AM - 5:00 PM Eastern
+- Fixed stop loss: 10-50 points
+- 1:1 Risk/Reward
+- Stricter entry filters
+
+Instruments: GC=F (Gold), NQ=F (Nasdaq), ES=F (S&P 500)
+"""
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import pytz
+import warnings
+warnings.filterwarnings('ignore')
+
+# =============================================================================
+# DATA FETCHING
+# =============================================================================
+
+def fetch_data(tickers, period="60d", interval="5m"):
+    """Fetch OHLCV data for multiple tickers."""
+    data = {}
+    for ticker in tickers:
+        print(f"Fetching {ticker} ({interval} bars)...")
+        df = yf.download(ticker, period=period, interval=interval, progress=False)
+        if len(df) > 0:
+            df.columns = df.columns.droplevel(1) if isinstance(df.columns, pd.MultiIndex) else df.columns
+            data[ticker] = df
+            print(f"  Got {len(df)} bars from {df.index[0]} to {df.index[-1]}")
+        else:
+            print(f"  WARNING: No data for {ticker}")
+    return data
+
+
+# =============================================================================
+# TIME FILTER
+# =============================================================================
+
+def apply_time_filter(df, start_hour=8, start_min=30, end_hour=17, end_min=0):
+    """
+    Filter data to only include bars within trading hours (Eastern Time).
+    """
+    eastern = pytz.timezone('US/Eastern')
+
+    # Convert index to Eastern time
+    if df.index.tz is None:
+        # Assume UTC if no timezone
+        df = df.copy()
+        df.index = df.index.tz_localize('UTC').tz_convert(eastern)
+    else:
+        df = df.copy()
+        df.index = df.index.tz_convert(eastern)
+
+    # Filter by time
+    start_time = pd.Timestamp('1900-01-01 {:02d}:{:02d}'.format(start_hour, start_min)).time()
+    end_time = pd.Timestamp('1900-01-01 {:02d}:{:02d}'.format(end_hour, end_min)).time()
+
+    mask = (df.index.time >= start_time) & (df.index.time <= end_time)
+    filtered = df[mask].copy()
+
+    print(f"  Time filter: {len(df)} -> {len(filtered)} bars ({start_hour}:{start_min:02d} - {end_hour}:{end_min:02d} ET)")
+
+    return filtered
+
+
+# =============================================================================
+# INDICATOR CALCULATIONS
+# =============================================================================
+
+def calculate_ema(series, period):
+    """Calculate EMA."""
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calculate_vwap_proxy(df, period=20):
+    """
+    Calculate a rolling VWAP-like measure.
+    """
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    vwap = (typical_price * df['Volume']).rolling(period).sum() / df['Volume'].rolling(period).sum()
+    return vwap
+
+
+def calculate_adx(df, period=14):
+    """Calculate ADX for regime filtering."""
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+
+    tr1 = high - low
+    tr2 = abs(high - close.shift(1))
+    tr3 = abs(low - close.shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
+
+    plus_di = 100 * pd.Series(plus_dm, index=df.index).rolling(period).mean() / atr
+    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(period).mean() / atr
+
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    adx = dx.rolling(period).mean()
+
+    return adx
+
+
+def calculate_zscore(price, mean, lookback=20):
+    """Calculate z-score of price relative to mean."""
+    deviation = price - mean
+    std = deviation.rolling(lookback).std()
+    zscore = deviation / std
+    return zscore
+
+
+def fit_polynomial(prices, window):
+    """
+    Fit quadratic polynomial to price over rolling window.
+    Returns velocity and acceleration coefficients.
+    """
+    n = len(prices)
+    velocity = np.full(n, np.nan)
+    acceleration = np.full(n, np.nan)
+
+    for i in range(window - 1, n):
+        y = prices[i - window + 1:i + 1].values
+        t = np.arange(window)
+
+        coeffs = np.polyfit(t, y, 2)
+        a2, a1, a0 = coeffs
+
+        velocity[i] = a1 + 2 * a2 * (window - 1)
+        acceleration[i] = 2 * a2
+
+    return velocity, acceleration
+
+
+def prepare_features(df, mean_type, poly_window, zscore_lookback=20):
+    """
+    Prepare all features for signal generation.
+    """
+    price = df['Close']
+
+    if mean_type == 'EMA20':
+        mean = calculate_ema(price, 20)
+    elif mean_type == 'EMA50':
+        mean = calculate_ema(price, 50)
+    elif mean_type == 'VWAP':
+        mean = calculate_vwap_proxy(df, 20)
+    else:
+        raise ValueError(f"Unknown mean type: {mean_type}")
+
+    zscore = calculate_zscore(price, mean, zscore_lookback)
+    velocity, acceleration = fit_polynomial(price, poly_window)
+    adx = calculate_adx(df, 14)
+
+    features = pd.DataFrame({
+        'price': price,
+        'high': df['High'],
+        'low': df['Low'],
+        'mean': mean,
+        'zscore': zscore,
+        'velocity': velocity,
+        'acceleration': acceleration,
+        'adx': adx
+    }, index=df.index)
+
+    return features
+
+
+# =============================================================================
+# SIGNAL GENERATION (TIGHTENED)
+# =============================================================================
+
+def generate_signals_tight(features, zscore_thresh=2.0, accel_percentile=50, adx_thresh=25):
+    """
+    Generate mean reversion signals with tightened filters.
+
+    Logic:
+    - Price extended from mean (z-score threshold)
+    - Acceleration opposing the move (turning around)
+    - Range day (ADX filter)
+    """
+    accel_abs = np.abs(features['acceleration'].dropna())
+    accel_thresh = np.percentile(accel_abs, accel_percentile)
+
+    signals = pd.Series(0, index=features.index)
+
+    # Range day filter
+    range_day = features['adx'] < adx_thresh
+
+    # Diagnostic: print how many bars pass each filter
+    zscore_long = features['zscore'] < -zscore_thresh
+    zscore_short = features['zscore'] > zscore_thresh
+    accel_long = features['acceleration'] > accel_thresh
+    accel_short = features['acceleration'] < -accel_thresh
+
+    print(f"\n  DIAGNOSTIC:")
+    print(f"    Total bars: {len(features)}")
+    print(f"    Z-score < -{zscore_thresh}: {zscore_long.sum()} bars")
+    print(f"    Z-score > +{zscore_thresh}: {zscore_short.sum()} bars")
+    print(f"    Accel > {accel_thresh:.4f} (long): {accel_long.sum()} bars")
+    print(f"    Accel < -{accel_thresh:.4f} (short): {accel_short.sum()} bars")
+    print(f"    ADX < {adx_thresh}: {range_day.sum()} bars")
+    print(f"    Long condition (all 3): {(zscore_long & accel_long & range_day).sum()} bars")
+    print(f"    Short condition (all 3): {(zscore_short & accel_short & range_day).sum()} bars")
+
+    # Long signals: price extended below mean, acceleration turning positive (reversing up)
+    long_condition = (
+        (features['zscore'] < -zscore_thresh) &
+        (features['acceleration'] > accel_thresh) &
+        range_day
+    )
+
+    # Short signals: price extended above mean, acceleration turning negative (reversing down)
+    short_condition = (
+        (features['zscore'] > zscore_thresh) &
+        (features['acceleration'] < -accel_thresh) &
+        range_day
+    )
+
+    signals[long_condition] = 1
+    signals[short_condition] = -1
+
+    return signals
+
+
+# =============================================================================
+# BACKTEST WITH FIXED STOPS AND 1:1 RR
+# =============================================================================
+
+def backtest_with_stops(features, signals, stop_points, ticker):
+    """
+    Backtest signals with fixed stop loss and 1:1 take profit.
+
+    Args:
+        features: DataFrame with price data
+        signals: Series with 1 (long), -1 (short), 0 (no signal)
+        stop_points: Stop loss distance in points
+        ticker: Ticker symbol for point value calculation
+
+    Returns:
+        DataFrame with trade results
+    """
+    # Point values (approximate for futures)
+    point_values = {
+        'NQ=F': 1.0,   # NQ moves in 0.25 increments, $5 per point
+        'ES=F': 1.0,   # ES moves in 0.25 increments, $12.50 per point
+        'GC=F': 1.0,   # Gold moves in 0.10 increments, $10 per point
+    }
+
+    trades = []
+
+    signal_indices = signals[signals != 0].index
+
+    for entry_time in signal_indices:
+        direction = signals[entry_time]  # 1 for long, -1 for short
+        entry_price = features.loc[entry_time, 'price']
+
+        # Calculate stop and target
+        if direction == 1:  # Long
+            stop_price = entry_price - stop_points
+            target_price = entry_price + stop_points  # 1:1 RR
+        else:  # Short
+            stop_price = entry_price + stop_points
+            target_price = entry_price - stop_points  # 1:1 RR
+
+        # Get future bars after entry
+        future_mask = features.index > entry_time
+        future_data = features[future_mask]
+
+        if len(future_data) == 0:
+            continue
+
+        # Simulate bar-by-bar to check stop/target hits
+        exit_price = None
+        exit_time = None
+        exit_reason = None
+
+        for bar_time, bar in future_data.iterrows():
+            bar_high = bar['high']
+            bar_low = bar['low']
+
+            if direction == 1:  # Long
+                # Check stop first (conservative)
+                if bar_low <= stop_price:
+                    exit_price = stop_price
+                    exit_time = bar_time
+                    exit_reason = 'stop'
+                    break
+                # Check target
+                elif bar_high >= target_price:
+                    exit_price = target_price
+                    exit_time = bar_time
+                    exit_reason = 'target'
+                    break
+            else:  # Short
+                # Check stop first
+                if bar_high >= stop_price:
+                    exit_price = stop_price
+                    exit_time = bar_time
+                    exit_reason = 'stop'
+                    break
+                # Check target
+                elif bar_low <= target_price:
+                    exit_price = target_price
+                    exit_time = bar_time
+                    exit_reason = 'target'
+                    break
+
+        # If no stop/target hit, use last bar (time exit)
+        if exit_price is None:
+            exit_price = future_data.iloc[-1]['price']
+            exit_time = future_data.index[-1]
+            exit_reason = 'time'
+
+        # Calculate P&L in points
+        if direction == 1:
+            pnl_points = exit_price - entry_price
+        else:
+            pnl_points = entry_price - exit_price
+
+        trades.append({
+            'entry_time': entry_time,
+            'exit_time': exit_time,
+            'direction': 'long' if direction == 1 else 'short',
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'stop_price': stop_price,
+            'target_price': target_price,
+            'pnl_points': pnl_points,
+            'exit_reason': exit_reason,
+            'win': pnl_points > 0
+        })
+
+    return pd.DataFrame(trades)
+
+
+def analyze_trades(trades_df, stop_points):
+    """Analyze trade results."""
+    if len(trades_df) == 0:
+        return {
+            'stop_points': stop_points,
+            'n_trades': 0,
+            'win_rate': np.nan,
+            'avg_pnl': np.nan,
+            'total_pnl': np.nan,
+            'profit_factor': np.nan,
+            'target_hits': np.nan,
+            'stop_hits': np.nan,
+            'time_exits': np.nan
+        }
+
+    wins = trades_df['win'].sum()
+    losses = len(trades_df) - wins
+
+    gross_profit = trades_df[trades_df['pnl_points'] > 0]['pnl_points'].sum()
+    gross_loss = abs(trades_df[trades_df['pnl_points'] < 0]['pnl_points'].sum())
+
+    return {
+        'stop_points': stop_points,
+        'n_trades': len(trades_df),
+        'win_rate': wins / len(trades_df) * 100,
+        'avg_pnl': trades_df['pnl_points'].mean(),
+        'total_pnl': trades_df['pnl_points'].sum(),
+        'profit_factor': gross_profit / gross_loss if gross_loss > 0 else np.inf,
+        'target_hits': (trades_df['exit_reason'] == 'target').sum(),
+        'stop_hits': (trades_df['exit_reason'] == 'stop').sum(),
+        'time_exits': (trades_df['exit_reason'] == 'time').sum(),
+        'avg_win': trades_df[trades_df['win']]['pnl_points'].mean() if wins > 0 else 0,
+        'avg_loss': trades_df[~trades_df['win']]['pnl_points'].mean() if losses > 0 else 0,
+        'long_trades': (trades_df['direction'] == 'long').sum(),
+        'short_trades': (trades_df['direction'] == 'short').sum(),
+        'long_win_rate': trades_df[trades_df['direction'] == 'long']['win'].mean() * 100 if (trades_df['direction'] == 'long').sum() > 0 else np.nan,
+        'short_win_rate': trades_df[trades_df['direction'] == 'short']['win'].mean() * 100 if (trades_df['direction'] == 'short').sum() > 0 else np.nan,
+    }
+
+
+# =============================================================================
+# PARAMETER SWEEP
+# =============================================================================
+
+def run_stop_sweep(df, ticker, mean_type, poly_window, zscore_thresh,
+                   accel_pct, adx_thresh, stop_points_list):
+    """
+    Run backtest across different stop loss values.
+    """
+    # Prepare features
+    features = prepare_features(df, mean_type, poly_window)
+
+    # Generate signals with tight filters
+    signals = generate_signals_tight(
+        features,
+        zscore_thresh=zscore_thresh,
+        accel_percentile=accel_pct,
+        adx_thresh=adx_thresh
+    )
+
+    n_signals = (signals != 0).sum()
+    print(f"  Generated {n_signals} signals")
+
+    if n_signals == 0:
+        print("  WARNING: No signals generated with current filters")
+        return pd.DataFrame()
+
+    # Test each stop level
+    results = []
+    for stop_pts in stop_points_list:
+        trades = backtest_with_stops(features, signals, stop_pts, ticker)
+        stats = analyze_trades(trades, stop_pts)
+        stats['mean_type'] = mean_type
+        stats['poly_window'] = poly_window
+        stats['zscore_thresh'] = zscore_thresh
+        results.append(stats)
+
+    return pd.DataFrame(results)
+
+
+# =============================================================================
+# REPORTING
+# =============================================================================
+
+def plot_stop_analysis(results_df, ticker, save_path=None):
+    """Plot analysis of different stop levels."""
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f'Stop Loss Analysis: {ticker} (1:1 RR)', fontsize=14, fontweight='bold')
+
+    # 1. Win Rate by Stop Distance
+    ax1 = axes[0, 0]
+    ax1.bar(results_df['stop_points'], results_df['win_rate'], color='steelblue', alpha=0.7)
+    ax1.axhline(y=50, color='red', linestyle='--', label='50% breakeven')
+    ax1.set_xlabel('Stop Loss (points)')
+    ax1.set_ylabel('Win Rate (%)')
+    ax1.set_title('Win Rate by Stop Distance')
+    ax1.legend()
+
+    # 2. Total P&L by Stop Distance
+    ax2 = axes[0, 1]
+    colors = ['green' if x > 0 else 'red' for x in results_df['total_pnl']]
+    ax2.bar(results_df['stop_points'], results_df['total_pnl'], color=colors, alpha=0.7)
+    ax2.axhline(y=0, color='black', linestyle='-', linewidth=0.5)
+    ax2.set_xlabel('Stop Loss (points)')
+    ax2.set_ylabel('Total P&L (points)')
+    ax2.set_title('Total P&L by Stop Distance')
+
+    # 3. Profit Factor by Stop Distance
+    ax3 = axes[1, 0]
+    pf = results_df['profit_factor'].replace([np.inf], results_df['profit_factor'][results_df['profit_factor'] != np.inf].max() * 1.5)
+    ax3.bar(results_df['stop_points'], pf, color='purple', alpha=0.7)
+    ax3.axhline(y=1, color='red', linestyle='--', label='Breakeven (PF=1)')
+    ax3.set_xlabel('Stop Loss (points)')
+    ax3.set_ylabel('Profit Factor')
+    ax3.set_title('Profit Factor by Stop Distance')
+    ax3.legend()
+
+    # 4. Exit Reason Breakdown
+    ax4 = axes[1, 1]
+    x = results_df['stop_points']
+    width = (x.max() - x.min()) / len(x) * 0.8 if len(x) > 1 else 5
+    ax4.bar(x - width/3, results_df['target_hits'], width/3, label='Target', color='green', alpha=0.7)
+    ax4.bar(x, results_df['stop_hits'], width/3, label='Stop', color='red', alpha=0.7)
+    ax4.bar(x + width/3, results_df['time_exits'], width/3, label='Time', color='gray', alpha=0.7)
+    ax4.set_xlabel('Stop Loss (points)')
+    ax4.set_ylabel('Number of Trades')
+    ax4.set_title('Exit Reason Breakdown')
+    ax4.legend()
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Saved plot to {save_path}")
+
+    plt.show()
+
+
+def print_results_table(results_df, ticker):
+    """Print formatted results table."""
+    print(f"\n{'='*80}")
+    print(f"RESULTS: {ticker}")
+    print(f"{'='*80}")
+
+    cols = ['stop_points', 'n_trades', 'win_rate', 'avg_pnl', 'total_pnl',
+            'profit_factor', 'target_hits', 'stop_hits', 'time_exits']
+
+    display_df = results_df[cols].copy()
+    display_df['win_rate'] = display_df['win_rate'].round(1)
+    display_df['avg_pnl'] = display_df['avg_pnl'].round(2)
+    display_df['total_pnl'] = display_df['total_pnl'].round(2)
+    display_df['profit_factor'] = display_df['profit_factor'].round(2)
+
+    print(display_df.to_string(index=False))
+
+    # Best configuration
+    if len(results_df) > 0 and results_df['total_pnl'].max() > 0:
+        best_idx = results_df['total_pnl'].idxmax()
+        best = results_df.loc[best_idx]
+        print(f"\nBEST STOP: {best['stop_points']} points")
+        print(f"  Win Rate: {best['win_rate']:.1f}%")
+        print(f"  Total P&L: {best['total_pnl']:.1f} points")
+        print(f"  Profit Factor: {best['profit_factor']:.2f}")
+        print(f"  Trades: {best['n_trades']} ({best['long_trades']:.0f} long, {best['short_trades']:.0f} short)")
+
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+def main():
+    # Configuration
+    TICKERS = ['NQ=F', 'ES=F', 'GC=F']
+
+    # Optimal mean types from previous backtest
+    OPTIMAL_MEAN = {
+        'NQ=F': 'VWAP',
+        'ES=F': 'EMA20',
+        'GC=F': 'EMA20'
+    }
+
+    # Parameters - loosened to get more signals
+    POLY_WINDOW = 20
+    ZSCORE_THRESH = 1.5  # Loosened from 2.0
+    ACCEL_PERCENTILE = 25  # Loosened from 50 (only need mild acceleration)
+    ADX_THRESH = 30  # Loosened from 25
+
+    # Stop loss sweep
+    STOP_POINTS_LIST = [10, 20, 30, 40, 50]
+
+    print("="*80)
+    print("TIGHTENED MEAN REVERSION BACKTEST")
+    print("Time Filter: 8:30 AM - 5:00 PM Eastern")
+    print("Fixed Stop Loss with 1:1 Risk/Reward")
+    print("="*80)
+
+    # Fetch data
+    data = fetch_data(TICKERS, period="60d", interval="5m")
+
+    if len(data) == 0:
+        print("ERROR: No data fetched")
+        return
+
+    # Apply time filter
+    print("\nApplying time filter...")
+    for ticker in data:
+        data[ticker] = apply_time_filter(data[ticker], 8, 30, 17, 0)
+
+    # Run backtest for each ticker
+    all_results = {}
+
+    for ticker, df in data.items():
+        print(f"\n{'='*80}")
+        print(f"BACKTESTING: {ticker}")
+        print(f"Mean Type: {OPTIMAL_MEAN[ticker]}")
+        print(f"Z-Score Threshold: {ZSCORE_THRESH}")
+        print(f"ADX Threshold: {ADX_THRESH}")
+        print(f"{'='*80}")
+
+        results = run_stop_sweep(
+            df,
+            ticker,
+            mean_type=OPTIMAL_MEAN[ticker],
+            poly_window=POLY_WINDOW,
+            zscore_thresh=ZSCORE_THRESH,
+            accel_pct=ACCEL_PERCENTILE,
+            adx_thresh=ADX_THRESH,
+            stop_points_list=STOP_POINTS_LIST
+        )
+
+        if len(results) > 0:
+            all_results[ticker] = results
+            print_results_table(results, ticker)
+            plot_stop_analysis(results, ticker, save_path=f'{ticker.replace("=", "_")}_stops.png')
+
+    # Save results
+    for ticker, results in all_results.items():
+        csv_path = f'{ticker.replace("=", "_")}_stop_analysis.csv'
+        results.to_csv(csv_path, index=False)
+        print(f"Saved results to {csv_path}")
+
+    print("\n" + "="*80)
+    print("BACKTEST COMPLETE")
+    print("="*80)
+
+    return all_results
+
+
+if __name__ == "__main__":
+    results = main()
