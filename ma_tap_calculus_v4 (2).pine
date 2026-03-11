@@ -1,0 +1,613 @@
+//@version=5
+indicator("MA Tap + Calculus Turning Points", overlay=true, max_labels_count=500)
+
+// =============================================================================
+// MA 1 (Primary - for tap detection)
+// =============================================================================
+grp_ma1 = "═══ MA 1 (Primary) ═══"
+ma1_enabled     = input.bool(true, "Enable MA 1", group=grp_ma1)
+ma1_length      = input.int(21, "Length", minval=2, maxval=500, group=grp_ma1)
+ma1_source      = input.string("HL2", "Source", options=["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], group=grp_ma1)
+ma1_type        = input.string("SMA", "Type", options=["SMA", "EMA"], group=grp_ma1)
+show_ma1        = input.bool(true, "Show MA 1", group=grp_ma1)
+ma1_style       = input.string("Line", "Style", options=["Line", "Dashed", "Circles"], group=grp_ma1)
+col_ma1         = input.color(color.yellow, "Color", group=grp_ma1)
+ma1_width       = input.int(2, "Width", minval=1, maxval=5, group=grp_ma1)
+
+// =============================================================================
+// MA 2
+// =============================================================================
+grp_ma2 = "═══ MA 2 ═══"
+ma2_enabled     = input.bool(false, "Enable MA 2", group=grp_ma2)
+ma2_length      = input.int(50, "Length", minval=2, maxval=500, group=grp_ma2)
+ma2_source      = input.string("Close", "Source", options=["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], group=grp_ma2)
+ma2_type        = input.string("SMA", "Type", options=["SMA", "EMA"], group=grp_ma2)
+show_ma2        = input.bool(true, "Show MA 2", group=grp_ma2)
+ma2_style       = input.string("Line", "Style", options=["Line", "Dashed", "Circles"], group=grp_ma2)
+col_ma2         = input.color(color.purple, "Color", group=grp_ma2)
+ma2_width       = input.int(1, "Width", minval=1, maxval=5, group=grp_ma2)
+
+// =============================================================================
+// MA 3
+// =============================================================================
+grp_ma3 = "═══ MA 3 ═══"
+ma3_enabled     = input.bool(false, "Enable MA 3", group=grp_ma3)
+ma3_length      = input.int(100, "Length", minval=2, maxval=500, group=grp_ma3)
+ma3_source      = input.string("Close", "Source", options=["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], group=grp_ma3)
+ma3_type        = input.string("SMA", "Type", options=["SMA", "EMA"], group=grp_ma3)
+show_ma3        = input.bool(true, "Show MA 3", group=grp_ma3)
+ma3_style       = input.string("Line", "Style", options=["Line", "Dashed", "Circles"], group=grp_ma3)
+col_ma3         = input.color(color.aqua, "Color", group=grp_ma3)
+ma3_width       = input.int(1, "Width", minval=1, maxval=5, group=grp_ma3)
+
+// =============================================================================
+// TOUCH ZONE SETTINGS
+// =============================================================================
+grp_zone = "═══ TOUCH ZONE ═══"
+zone_mode       = input.string("Fixed Points", "Zone Mode", options=["Fixed Points", "Between Two MAs"], group=grp_zone)
+touch_zone      = input.float(6.0, "Fixed Zone Size (pts)", minval=0.5, maxval=50.0, step=0.5, group=grp_zone, tooltip="Used when Zone Mode = Fixed Points")
+zone_ma_upper   = input.string("MA 1", "Upper MA", options=["MA 1", "MA 2", "MA 3"], group=grp_zone, tooltip="Used when Zone Mode = Between Two MAs")
+zone_ma_lower   = input.string("MA 2", "Lower MA", options=["MA 1", "MA 2", "MA 3"], group=grp_zone, tooltip="Used when Zone Mode = Between Two MAs")
+show_touch_zone = input.bool(true, "Show Touch Zone", group=grp_zone)
+col_zone        = input.color(color.new(color.yellow, 85), "Zone Color", group=grp_zone)
+lookback        = input.int(10, "Lookback Bars (price away from zone)", minval=1, maxval=50, group=grp_zone)
+
+// =============================================================================
+// VELOCITY CALCULATION (for turning points)
+// =============================================================================
+grp_velocity = "═══ VELOCITY (for turning points) ═══"
+vel_length      = input.int(10, "Velocity MA Length", minval=2, maxval=100, group=grp_velocity)
+vel_source      = input.string("Close", "Velocity Source", options=["Close", "Open", "High", "Low", "HL2", "HLC3", "OHLC4"], group=grp_velocity)
+vel_type        = input.string("EMA", "Velocity MA Type", options=["EMA", "SMA"], group=grp_velocity, tooltip="EMA reacts faster (earlier signals). SMA is smoother (fewer false signals).")
+show_vel_ma     = input.bool(false, "Show Velocity MA", group=grp_velocity)
+col_vel_ma      = input.color(color.blue, "Velocity MA Color", group=grp_velocity)
+
+// =============================================================================
+// ENTRY REQUIREMENTS (ALL CHECKED = ALL MUST BE TRUE)
+// =============================================================================
+grp_rules = "═══ ENTRY REQUIREMENTS ═══"
+require_ma_tap      = input.bool(true, "☑ Require MA Tap", group=grp_rules, tooltip="Price must touch zone")
+require_local       = input.bool(true, "☑ Require Local Min/Max", group=grp_rules, tooltip="Velocity must cross zero. Local MIN pairs with LONG (bullish MA tap). Local MAX pairs with SHORT (bearish MA tap).")
+require_inflection  = input.bool(false, "☑ Require Inflection First", group=grp_rules, tooltip="Acceleration must have crossed zero within lookback")
+inflection_lookback = input.int(5, "    └ Inflection Lookback (bars)", minval=1, maxval=20, group=grp_rules)
+cooldown            = input.int(5, "Cooldown Between Signals", minval=1, maxval=50, group=grp_rules)
+
+// =============================================================================
+// SIGNAL TIMING (when both MA Tap and Local Min/Max are required)
+// =============================================================================
+grp_timing = "═══ SIGNAL TIMING ═══"
+signal_mode         = input.string("Same Bar", "Signal Mode", options=["Same Bar", "Local First → MA Tap", "MA Tap First → Local", "Either Order"], group=grp_timing, tooltip="Same Bar: Both must occur together. Local First: Local min/max happens, then MA tap within X bars. MA Tap First: MA tap happens, then local min/max within X bars. Either Order: Either sequence works.")
+signal_window       = input.int(5, "Signal Window (bars)", minval=1, maxval=20, group=grp_timing, tooltip="How many bars to wait for the second signal")
+
+// =============================================================================
+// DISPLAY OPTIONS
+// =============================================================================
+grp_display = "═══ DISPLAY OPTIONS ═══"
+show_combined       = input.bool(true, "Show Entry Signals (▲▼)", group=grp_display)
+show_inflection     = input.bool(true, "Show Inflection Points (◆)", group=grp_display)
+show_local_minmax   = input.bool(true, "Show Local Min/Max (small ▲▼)", group=grp_display)
+show_ma_tap_only    = input.bool(false, "Show MA Tap Only (●)", group=grp_display)
+show_table          = input.bool(true, "Show Info Table", group=grp_display)
+
+// =============================================================================
+// TP/SL VISUALIZATION
+// =============================================================================
+grp_tpsl = "═══ TP/SL LEVELS ═══"
+show_levels     = input.bool(false, "Show TP/SL Levels", group=grp_tpsl)
+tp_points       = input.float(25.0, "Take Profit (pts)", minval=1.0, maxval=200.0, group=grp_tpsl)
+
+// =============================================================================
+// COLORS
+// =============================================================================
+grp_colors = "═══ SIGNAL COLORS ═══"
+col_long        = input.color(color.green, "Long Color", group=grp_colors)
+col_short       = input.color(color.red, "Short Color", group=grp_colors)
+col_inflection  = input.color(color.orange, "Inflection Color", group=grp_colors)
+
+// =============================================================================
+// TABLE COLORS
+// =============================================================================
+grp_table = "═══ TABLE COLORS ═══"
+col_table_bg    = input.color(color.new(color.black, 80), "Table Background", group=grp_table)
+col_table_text  = input.color(color.white, "Table Text (headers)", group=grp_table)
+col_table_label = input.color(color.gray, "Table Labels", group=grp_table)
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+get_source(src_str) =>
+    switch src_str
+        "Close" => close
+        "Open" => open
+        "High" => high
+        "Low" => low
+        "HL2" => hl2
+        "HLC3" => hlc3
+        "OHLC4" => ohlc4
+        => close
+
+get_ma(src, len, ma_type) =>
+    ma_type == "EMA" ? ta.ema(src, len) : ta.sma(src, len)
+
+// =============================================================================
+// CALCULATIONS - MA 1
+// =============================================================================
+ma1_src  = get_source(ma1_source)
+ma1_line = ma1_enabled ? get_ma(ma1_src, ma1_length, ma1_type) : na
+
+// =============================================================================
+// CALCULATIONS - MA 2
+// =============================================================================
+ma2_src  = get_source(ma2_source)
+ma2_line = ma2_enabled ? get_ma(ma2_src, ma2_length, ma2_type) : na
+
+// =============================================================================
+// CALCULATIONS - MA 3
+// =============================================================================
+ma3_src  = get_source(ma3_source)
+ma3_line = ma3_enabled ? get_ma(ma3_src, ma3_length, ma3_type) : na
+
+// =============================================================================
+// CALCULATIONS - VELOCITY MA (for turning points)
+// =============================================================================
+vel_src      = get_source(vel_source)
+vel_ma       = get_ma(vel_src, vel_length, vel_type)
+velocity     = vel_ma - vel_ma[1]
+acceleration = velocity - velocity[1]
+
+// =============================================================================
+// GET MA VALUE BY SELECTION
+// =============================================================================
+get_ma_value(selection) =>
+    switch selection
+        "MA 1" => ma1_line
+        "MA 2" => ma2_line
+        "MA 3" => ma3_line
+        => ma1_line
+
+// =============================================================================
+// TOUCH ZONE CALCULATION
+// =============================================================================
+// Default center for fixed zone
+zone_center = na(ma1_line) ? close : ma1_line
+
+zone_upper = zone_mode == "Fixed Points" ? zone_center + touch_zone : math.max(nz(get_ma_value(zone_ma_upper), close), nz(get_ma_value(zone_ma_lower), close))
+zone_lower = zone_mode == "Fixed Points" ? zone_center - touch_zone : math.min(nz(get_ma_value(zone_ma_upper), close), nz(get_ma_value(zone_ma_lower), close))
+
+// =============================================================================
+// SIGNAL: INFLECTION POINTS (acceleration crosses zero)
+// =============================================================================
+inflection_up   = acceleration > 0 and acceleration[1] <= 0
+inflection_down = acceleration < 0 and acceleration[1] >= 0
+
+// =============================================================================
+// SIGNAL: LOCAL MIN/MAX (velocity crosses zero + acceleration confirms)
+// =============================================================================
+vel_cross_up   = velocity > 0 and velocity[1] <= 0
+vel_cross_down = velocity < 0 and velocity[1] >= 0
+
+local_min = vel_cross_up and acceleration > 0
+local_max = vel_cross_down and acceleration < 0
+
+// =============================================================================
+// CHECK FOR RECENT INFLECTION (within lookback bars)
+// =============================================================================
+recent_inflection_up = false
+recent_inflection_down = false
+
+for i = 1 to inflection_lookback
+    if inflection_up[i]
+        recent_inflection_up := true
+    if inflection_down[i]
+        recent_inflection_down := true
+
+// =============================================================================
+// MA TAP DETECTION (using dynamic zone)
+// =============================================================================
+long_lookback_ok = true
+short_lookback_ok = true
+
+for i = 1 to lookback
+    if low[i] <= zone_upper[i]
+        long_lookback_ok := false
+    if high[i] >= zone_lower[i]
+        short_lookback_ok := false
+
+// LONG tap: price from above, wick into zone, close above
+long_reach = low <= zone_upper and low >= zone_lower
+long_close = close > zone_upper
+ma_tap_long = long_lookback_ok and long_reach and long_close
+
+// SHORT tap: price from below, wick into zone, close below
+short_reach = high >= zone_lower and high <= zone_upper
+short_close = close < zone_lower
+ma_tap_short = short_lookback_ok and short_reach and short_close
+
+// =============================================================================
+// CHECK FOR RECENT LOCAL MIN/MAX (within signal window)
+// =============================================================================
+recent_local_min = false
+recent_local_max = false
+
+for i = 1 to signal_window
+    if local_min[i]
+        recent_local_min := true
+    if local_max[i]
+        recent_local_max := true
+
+// =============================================================================
+// CHECK FOR RECENT MA TAP (within signal window)
+// =============================================================================
+recent_ma_tap_long = false
+recent_ma_tap_short = false
+
+for i = 1 to signal_window
+    if ma_tap_long[i]
+        recent_ma_tap_long := true
+    if ma_tap_short[i]
+        recent_ma_tap_short := true
+
+// =============================================================================
+// COMBINED ENTRY SIGNAL (based on timing mode)
+// =============================================================================
+// DIRECTION MATCHING (automatic):
+//   Local MIN (bullish turn) → only pairs with LONG MA tap (bullish)
+//   Local MAX (bearish turn) → only pairs with SHORT MA tap (bearish)
+// This prevents conflicting signals (e.g., bearish local max + bullish MA tap)
+
+entry_long = true
+entry_short = true
+
+requirements_checked = 0
+if require_ma_tap
+    requirements_checked += 1
+if require_local
+    requirements_checked += 1
+if require_inflection
+    requirements_checked += 1
+
+if requirements_checked == 0
+    entry_long := false
+    entry_short := false
+else
+    // Handle MA Tap + Local Min/Max combination based on timing mode
+    if require_ma_tap and require_local
+        if signal_mode == "Same Bar"
+            // Both must happen on same bar
+            entry_long := entry_long and ma_tap_long and local_min
+            entry_short := entry_short and ma_tap_short and local_max
+        else if signal_mode == "Local First → MA Tap"
+            // Local min/max happened recently, now MA tap fires
+            entry_long := entry_long and ma_tap_long and recent_local_min
+            entry_short := entry_short and ma_tap_short and recent_local_max
+        else if signal_mode == "MA Tap First → Local"
+            // MA tap happened recently, now local min/max fires
+            entry_long := entry_long and recent_ma_tap_long and local_min
+            entry_short := entry_short and recent_ma_tap_short and local_max
+        else if signal_mode == "Either Order"
+            // Either sequence works
+            long_seq1 = ma_tap_long and recent_local_min      // MA tap now, local was recent
+            long_seq2 = local_min and recent_ma_tap_long      // Local now, MA tap was recent
+            long_same = ma_tap_long and local_min             // Both now
+            entry_long := entry_long and (long_seq1 or long_seq2 or long_same)
+            
+            short_seq1 = ma_tap_short and recent_local_max
+            short_seq2 = local_max and recent_ma_tap_short
+            short_same = ma_tap_short and local_max
+            entry_short := entry_short and (short_seq1 or short_seq2 or short_same)
+    else
+        // Only one of MA Tap or Local is required
+        if require_ma_tap
+            entry_long := entry_long and ma_tap_long
+            entry_short := entry_short and ma_tap_short
+        
+        if require_local
+            entry_long := entry_long and local_min
+            entry_short := entry_short and local_max
+    
+    // Inflection requirement (always uses its own lookback)
+    if require_inflection
+        entry_long := entry_long and recent_inflection_up
+        entry_short := entry_short and recent_inflection_down
+
+// =============================================================================
+// COOLDOWN
+// =============================================================================
+var int last_signal_bar = 0
+cooldown_ok = bar_index - last_signal_bar >= cooldown
+
+entry_long_final  = entry_long and cooldown_ok
+entry_short_final = entry_short and cooldown_ok
+
+if entry_long_final or entry_short_final
+    last_signal_bar := bar_index
+
+// =============================================================================
+// PLOTTING - MAs
+// =============================================================================
+// MA 1
+plot(show_ma1 and ma1_enabled and ma1_style == "Line" ? ma1_line : na, "MA 1", color=col_ma1, linewidth=ma1_width)
+plot(show_ma1 and ma1_enabled and ma1_style == "Dashed" ? ma1_line : na, "MA 1 Dashed", color=col_ma1, linewidth=ma1_width, style=plot.style_linebr)
+plot(show_ma1 and ma1_enabled and ma1_style == "Circles" ? ma1_line : na, "MA 1 Circles", color=col_ma1, linewidth=ma1_width, style=plot.style_circles)
+
+// MA 2
+plot(show_ma2 and ma2_enabled and ma2_style == "Line" ? ma2_line : na, "MA 2", color=col_ma2, linewidth=ma2_width)
+plot(show_ma2 and ma2_enabled and ma2_style == "Dashed" ? ma2_line : na, "MA 2 Dashed", color=col_ma2, linewidth=ma2_width, style=plot.style_linebr)
+plot(show_ma2 and ma2_enabled and ma2_style == "Circles" ? ma2_line : na, "MA 2 Circles", color=col_ma2, linewidth=ma2_width, style=plot.style_circles)
+
+// MA 3
+plot(show_ma3 and ma3_enabled and ma3_style == "Line" ? ma3_line : na, "MA 3", color=col_ma3, linewidth=ma3_width)
+plot(show_ma3 and ma3_enabled and ma3_style == "Dashed" ? ma3_line : na, "MA 3 Dashed", color=col_ma3, linewidth=ma3_width, style=plot.style_linebr)
+plot(show_ma3 and ma3_enabled and ma3_style == "Circles" ? ma3_line : na, "MA 3 Circles", color=col_ma3, linewidth=ma3_width, style=plot.style_circles)
+
+// Velocity MA
+plot(show_vel_ma ? vel_ma : na, "Velocity MA", color=col_vel_ma, linewidth=1, style=plot.style_line)
+
+// =============================================================================
+// PLOTTING - TOUCH ZONE
+// =============================================================================
+p_upper = plot(show_touch_zone ? zone_upper : na, "Zone Upper", color=color.new(col_zone, 60))
+p_lower = plot(show_touch_zone ? zone_lower : na, "Zone Lower", color=color.new(col_zone, 60))
+fill(p_upper, p_lower, color=show_touch_zone ? col_zone : na)
+
+// =============================================================================
+// PLOTTING - ENTRY SIGNALS
+// =============================================================================
+plotshape(show_combined and entry_long_final, "▲ ENTRY LONG", 
+          shape.triangleup, location.belowbar, 
+          color=col_long, size=size.normal)
+plotshape(show_combined and entry_short_final, "▼ ENTRY SHORT", 
+          shape.triangledown, location.abovebar, 
+          color=col_short, size=size.normal)
+
+// =============================================================================
+// PLOTTING - COMPONENT SIGNALS
+// =============================================================================
+plotshape(show_inflection and inflection_up and not entry_long_final, "Inflection Up", 
+          shape.diamond, location.belowbar, 
+          color=col_inflection, size=size.tiny)
+plotshape(show_inflection and inflection_down and not entry_short_final, "Inflection Down", 
+          shape.diamond, location.abovebar, 
+          color=col_inflection, size=size.tiny)
+
+plotshape(show_local_minmax and local_min and not entry_long_final, "Local Min", 
+          shape.triangleup, location.belowbar, 
+          color=color.new(col_long, 50), size=size.tiny)
+plotshape(show_local_minmax and local_max and not entry_short_final, "Local Max", 
+          shape.triangledown, location.abovebar, 
+          color=color.new(col_short, 50), size=size.tiny)
+
+plotshape(show_ma_tap_only and ma_tap_long and not entry_long_final, "MA Tap Long", 
+          shape.circle, location.belowbar, 
+          color=color.new(col_long, 60), size=size.tiny)
+plotshape(show_ma_tap_only and ma_tap_short and not entry_short_final, "MA Tap Short", 
+          shape.circle, location.abovebar, 
+          color=color.new(col_short, 60), size=size.tiny)
+
+// =============================================================================
+// ENTRY PRICE & TP/SL LEVELS
+// =============================================================================
+show_entry_label = input.bool(true, "Show Entry Price Label", group=grp_tpsl)
+entry_type       = input.string("Zone Edge", "Entry Price Type", options=["Zone Edge", "Close", "Open Next Bar"], group=grp_tpsl, tooltip="Zone Edge = limit at MA zone. Close = market at signal bar close. Open Next Bar = market at next bar open.")
+
+var float entry_price = na
+var float display_entry = na
+var int   trade_dir   = 0
+
+// Calculate entry price based on type
+if entry_long_final
+    if entry_type == "Zone Edge"
+        entry_price := zone_upper
+    else if entry_type == "Close"
+        entry_price := close
+    else
+        entry_price := open  // Will be next bar open in live, but use current open for display
+    display_entry := entry_price
+    trade_dir   := 1
+    
+if entry_short_final
+    if entry_type == "Zone Edge"
+        entry_price := zone_lower
+    else if entry_type == "Close"
+        entry_price := close
+    else
+        entry_price := open
+    display_entry := entry_price
+    trade_dir   := -1
+
+tp_long  = trade_dir == 1 ? entry_price + tp_points : na
+sl_long  = trade_dir == 1 ? zone_lower : na
+tp_short = trade_dir == -1 ? entry_price - tp_points : na
+sl_short = trade_dir == -1 ? zone_upper : na
+
+plot(show_levels ? tp_long : na, "TP Long", color=col_long, style=plot.style_linebr, linewidth=1)
+plot(show_levels ? sl_long : na, "SL Long", color=col_short, style=plot.style_linebr, linewidth=1)
+plot(show_levels ? tp_short : na, "TP Short", color=col_long, style=plot.style_linebr, linewidth=1)
+plot(show_levels ? sl_short : na, "SL Short", color=col_short, style=plot.style_linebr, linewidth=1)
+
+// Entry price labels
+if show_entry_label and entry_long_final
+    label.new(bar_index, low, "LONG @ " + str.tostring(entry_price, "#.##"), 
+              style=label.style_label_up, color=col_long, textcolor=color.white, size=size.small)
+
+if show_entry_label and entry_short_final
+    label.new(bar_index, high, "SHORT @ " + str.tostring(entry_price, "#.##"), 
+              style=label.style_label_down, color=col_short, textcolor=color.white, size=size.small)
+
+// =============================================================================
+// INFO TABLE
+// =============================================================================
+var table info = table.new(position.top_right, 2, 26, bgcolor=col_table_bg)
+
+if barstate.islast and show_table
+    row = 0
+    
+    // Header
+    table.cell(info, 0, row, "MA Tap + Calculus", text_color=col_table_text, text_size=size.small)
+    table.cell(info, 1, row, "", text_color=col_table_text)
+    row += 1
+    
+    // MA 1
+    if ma1_enabled
+        table.cell(info, 0, row, "MA 1", text_color=col_table_label, text_size=size.tiny)
+        table.cell(info, 1, row, ma1_type + "(" + str.tostring(ma1_length) + ") " + ma1_source, text_color=col_ma1, text_size=size.tiny)
+        row += 1
+    
+    // MA 2
+    if ma2_enabled
+        table.cell(info, 0, row, "MA 2", text_color=col_table_label, text_size=size.tiny)
+        table.cell(info, 1, row, ma2_type + "(" + str.tostring(ma2_length) + ") " + ma2_source, text_color=col_ma2, text_size=size.tiny)
+        row += 1
+    
+    // MA 3
+    if ma3_enabled
+        table.cell(info, 0, row, "MA 3", text_color=col_table_label, text_size=size.tiny)
+        table.cell(info, 1, row, ma3_type + "(" + str.tostring(ma3_length) + ") " + ma3_source, text_color=col_ma3, text_size=size.tiny)
+        row += 1
+    
+    // Velocity MA
+    table.cell(info, 0, row, "Velocity", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, vel_type + "(" + str.tostring(vel_length) + ") " + vel_source, text_color=col_vel_ma, text_size=size.tiny)
+    row += 1
+    
+    // Zone
+    table.cell(info, 0, row, "Zone", text_color=col_table_label, text_size=size.tiny)
+    zone_str = zone_mode == "Fixed Points" ? "±" + str.tostring(touch_zone, "#.#") + " pts" : zone_ma_upper + " to " + zone_ma_lower
+    table.cell(info, 1, row, zone_str, text_color=col_table_text, text_size=size.tiny)
+    row += 1
+    
+    // Divider
+    table.cell(info, 0, row, "───────", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, "───────", text_color=col_table_label, text_size=size.tiny)
+    row += 1
+    
+    // Requirements header
+    table.cell(info, 0, row, "REQUIREMENTS", text_color=col_table_text, text_size=size.tiny)
+    table.cell(info, 1, row, "", text_color=col_table_label, text_size=size.tiny)
+    row += 1
+    
+    // MA Tap status
+    ma_status = require_ma_tap ? (ma_tap_long ? "✓ LONG" : ma_tap_short ? "✓ SHORT" : "✗") : "OFF"
+    ma_col = require_ma_tap ? (ma_tap_long ? col_long : ma_tap_short ? col_short : col_table_label) : col_table_label
+    table.cell(info, 0, row, "MA Tap", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, ma_status, text_color=ma_col, text_size=size.tiny)
+    row += 1
+    
+    // Local status
+    local_status = require_local ? (local_min ? "✓ MIN" : local_max ? "✓ MAX" : "✗") : "OFF"
+    local_col = require_local ? (local_min ? col_long : local_max ? col_short : col_table_label) : col_table_label
+    table.cell(info, 0, row, "Local Min/Max", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, local_status, text_color=local_col, text_size=size.tiny)
+    row += 1
+    
+    // Inflection status
+    infl_status = require_inflection ? (recent_inflection_up ? "✓ UP" : recent_inflection_down ? "✓ DOWN" : "✗") : "OFF"
+    infl_col = require_inflection ? (recent_inflection_up or recent_inflection_down ? col_inflection : col_table_label) : col_table_label
+    table.cell(info, 0, row, "Inflection", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, infl_status, text_color=infl_col, text_size=size.tiny)
+    row += 1
+    
+    // Timing mode (only show if both MA tap and Local are required)
+    if require_ma_tap and require_local
+        timing_str = signal_mode == "Same Bar" ? "Same Bar" : signal_mode == "Local First → MA Tap" ? "Local→MA" : signal_mode == "MA Tap First → Local" ? "MA→Local" : "Either"
+        table.cell(info, 0, row, "Timing", text_color=col_table_label, text_size=size.tiny)
+        table.cell(info, 1, row, timing_str + " (" + str.tostring(signal_window) + ")", text_color=col_table_text, text_size=size.tiny)
+        row += 1
+        
+        // Recent signals status
+        if signal_mode != "Same Bar"
+            recent_str = ""
+            looking_str = ""
+            
+            if recent_local_min
+                recent_str := "Local▲ "
+                if signal_mode == "Local First → MA Tap"
+                    looking_str := "→ Need MA▲"
+            if recent_local_max
+                recent_str := recent_str + "Local▼ "
+                if signal_mode == "Local First → MA Tap"
+                    looking_str := "→ Need MA▼"
+            if recent_ma_tap_long
+                recent_str := recent_str + "MA▲ "
+                if signal_mode == "MA Tap First → Local"
+                    looking_str := "→ Need Local▲"
+            if recent_ma_tap_short
+                recent_str := recent_str + "MA▼"
+                if signal_mode == "MA Tap First → Local"
+                    looking_str := "→ Need Local▼"
+            if recent_str == ""
+                recent_str := "None"
+            
+            table.cell(info, 0, row, "Recent", text_color=col_table_label, text_size=size.tiny)
+            table.cell(info, 1, row, recent_str, text_color=col_table_text, text_size=size.tiny)
+            row += 1
+            
+            // Show what we're looking for
+            if looking_str != ""
+                table.cell(info, 0, row, "Next", text_color=col_table_label, text_size=size.tiny)
+                table.cell(info, 1, row, looking_str, text_color=col_inflection, text_size=size.tiny)
+                row += 1
+    
+    // Divider
+    table.cell(info, 0, row, "───────", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, "───────", text_color=col_table_label, text_size=size.tiny)
+    row += 1
+    
+    // Velocity value
+    table.cell(info, 0, row, "Vel", text_color=col_table_label, text_size=size.tiny)
+    vel_str = velocity > 0 ? "▲ " + str.tostring(velocity, "#.##") : "▼ " + str.tostring(velocity, "#.##")
+    table.cell(info, 1, row, vel_str, text_color=velocity > 0 ? col_long : col_short, text_size=size.tiny)
+    row += 1
+    
+    // Acceleration value
+    table.cell(info, 0, row, "Accel", text_color=col_table_label, text_size=size.tiny)
+    acc_str = acceleration > 0 ? "▲ " + str.tostring(acceleration, "#.##") : "▼ " + str.tostring(acceleration, "#.##")
+    table.cell(info, 1, row, acc_str, text_color=acceleration > 0 ? col_long : col_short, text_size=size.tiny)
+    row += 1
+    
+    // Divider
+    table.cell(info, 0, row, "───────", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, "───────", text_color=col_table_label, text_size=size.tiny)
+    row += 1
+    
+    // Status
+    status = ""
+    status_col = col_table_label
+    if entry_long_final
+        status := "⚡ ENTRY LONG"
+        status_col := col_long
+    else if entry_short_final
+        status := "⚡ ENTRY SHORT"
+        status_col := col_short
+    else if entry_long and not cooldown_ok
+        status := "Long (cooldown)"
+        status_col := color.new(col_long, 50)
+    else if entry_short and not cooldown_ok
+        status := "Short (cooldown)"
+        status_col := color.new(col_short, 50)
+    else
+        status := "Waiting..."
+    
+    table.cell(info, 0, row, "STATUS", text_color=col_table_label, text_size=size.tiny)
+    table.cell(info, 1, row, status, text_color=status_col, text_size=size.tiny)
+    row += 1
+    
+    // Entry price (if we have one)
+    if not na(display_entry) and trade_dir != 0
+        dir_str = trade_dir == 1 ? "LONG" : "SHORT"
+        table.cell(info, 0, row, "Entry", text_color=col_table_label, text_size=size.tiny)
+        table.cell(info, 1, row, dir_str + " @ " + str.tostring(display_entry, "#.##"), text_color=trade_dir == 1 ? col_long : col_short, text_size=size.tiny)
+
+// =============================================================================
+// ALERTS
+// =============================================================================
+alertcondition(entry_long_final, "⚡ Entry Long", "All requirements met - LONG")
+alertcondition(entry_short_final, "⚡ Entry Short", "All requirements met - SHORT")
+alertcondition(entry_long_final or entry_short_final, "⚡ Any Entry", "All requirements met - Signal")
+
+alertcondition(local_min, "Local Min", "Local Minimum Detected")
+alertcondition(local_max, "Local Max", "Local Maximum Detected")
+alertcondition(inflection_up, "Inflection Up", "Inflection Point Up")
+alertcondition(inflection_down, "Inflection Down", "Inflection Point Down")
+alertcondition(ma_tap_long, "MA Tap Long", "Price tapped zone from above")
+alertcondition(ma_tap_short, "MA Tap Short", "Price tapped zone from below")
